@@ -85,6 +85,10 @@ impl MemoryAttr {
         self.user = true;
         self
     }
+    pub fn kernel(mut self) -> Self {
+        self.user = false;
+        self
+    }
     pub fn readonly(mut self) -> Self {
         self.readonly = true;
         self
@@ -121,6 +125,22 @@ pub struct MemorySet<T: PageTableExt> {
     page_table: T,
 }
 
+/// WARN : match the KSTACK_SIZE in rcore::memory::KSTACK_SIZE
+const KSTACK_SIZE: usize = 0x4000;
+/// Get kstack of the current thread, but we can't call rcore::process::current_thread()
+/// Noticing that KernelStack is aligned with KSTACK_SIZE, we read %rsp directly to get kstack
+#[cfg(any(target_arch = "x86_64"))]
+pub unsafe fn kernel_stack_range() -> (usize, usize) {
+    let mut kstack_bottom: usize = 0;
+    asm!("mov %rsp, $0": "=r"(kstack_bottom));
+    kstack_bottom &= !(KSTACK_SIZE - 1);
+    (kstack_bottom, kstack_bottom + KSTACK_SIZE)
+}
+#[cfg(not(any(target_arch = "x86_64")))]
+pub unsafe fn kernel_stack_range() -> (usize, usize) {
+    (0, 0)
+}
+
 impl<T: PageTableExt> MemorySet<T> {
     /// Create a new `MemorySet`
     pub fn new() -> Self {
@@ -150,6 +170,16 @@ impl<T: PageTableExt> MemorySet<T> {
         ptr: *const S,
         count: usize,
     ) -> VMResult<&'static [S]> {
+        // Check the array is within the kernel stack (kernel space)
+        match kernel_stack_range() {
+            (0, 0) => info!("not check kernel stack"),
+            (kstack_bottom, kstack_top) => {
+                if ptr as usize >= kstack_bottom && ptr as usize + count < kstack_top {
+                    return Ok(core::slice::from_raw_parts(ptr, count));
+                }
+            }
+        }
+        // Check the array is within the vm (user space)
         let mut valid_size = 0;
         for area in self.areas.iter() {
             valid_size += area.check_read_array(ptr, count);
@@ -165,6 +195,16 @@ impl<T: PageTableExt> MemorySet<T> {
         ptr: *mut S,
         count: usize,
     ) -> VMResult<&'static mut [S]> {
+        // Check the array is within the kernel stack (kernel space)
+        match kernel_stack_range() {
+            (0, 0) => info!("not check kernel stack"),
+            (kstack_bottom, kstack_top) => {
+                if ptr as usize >= kstack_bottom && ptr as usize + count < kstack_top {
+                    return Ok(core::slice::from_raw_parts_mut(ptr, count));
+                }
+            }
+        }
+        // Check the array is within the vm (user space)
         let mut valid_size = 0;
         for area in self.areas.iter() {
             valid_size += area.check_write_array(ptr, count);
@@ -377,10 +417,19 @@ impl<T: PageTableExt> MemorySet<T> {
     }
 
     pub fn handle_page_fault(&mut self, addr: VirtAddr) -> bool {
+        warn!("page fault at : {:#x?}", addr);
+        //self.areas.iter().map(|area| info!("{:#x?}", area));
         let area = self.areas.iter().find(|area| area.contains(addr));
+        // info!("area num = {}", self.areas.iter().count());
         match area {
-            Some(area) => area.handler.handle_page_fault(&mut self.page_table, addr),
-            None => false,
+            Some(area) => {
+                // info!("some(area)");
+                area.handler.handle_page_fault(&mut self.page_table, addr)
+            }
+            None => {
+                info!("not match area");
+                false
+            }
         }
     }
 

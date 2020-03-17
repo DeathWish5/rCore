@@ -61,12 +61,23 @@ pub struct TrapFrame {
 
 /// 用于在内核栈中构造新线程的中断帧
 impl TrapFrame {
-    fn new_kernel_thread(entry: extern "C" fn(usize) -> !, arg: usize, rsp: usize) -> Self {
+    pub fn new_kernel_thread(entry: usize, arg: usize, rsp: usize) -> Self {
         use crate::arch::gdt;
         let mut tf = TrapFrame::default();
         tf.rdi = arg;
         tf.cs = gdt::KCODE_SELECTOR.0 as usize;
-        tf.rip = entry as usize;
+        tf.rip = entry;
+        tf.ss = gdt::KDATA_SELECTOR.0 as usize;
+        tf.rsp = rsp;
+        tf.rflags = 0x282;
+        tf.fpstate_offset = 16; // skip restoring for first time
+        tf
+    }
+    pub fn new_kernel_thread_for_user(entry: usize, rsp: usize) -> Self {
+        use crate::arch::gdt;
+        let mut tf = TrapFrame::default();
+        tf.cs = gdt::KCODE_SELECTOR.0 as usize;
+        tf.rip = entry;
         tf.ss = gdt::KDATA_SELECTOR.0 as usize;
         tf.rsp = rsp;
         tf.rflags = 0x282;
@@ -112,7 +123,7 @@ impl ContextData {
 /// 新线程的内核栈初始内容
 #[derive(Debug)]
 #[repr(C)]
-struct InitStack {
+pub struct InitStack {
     context: ContextData,
     tf: TrapFrame,
 }
@@ -130,7 +141,7 @@ extern "C" {
 }
 
 #[derive(Debug)]
-pub struct Context(usize);
+pub struct Context(pub usize);
 
 impl Context {
     /// Switch to another kernel thread.
@@ -181,7 +192,7 @@ impl Context {
     }
 
     pub unsafe fn new_kernel_thread(
-        entry: extern "C" fn(usize) -> !,
+        entry: usize,
         arg: usize,
         kstack_top: usize,
         cr3: usize,
@@ -189,6 +200,18 @@ impl Context {
         InitStack {
             context: ContextData::new(cr3),
             tf: TrapFrame::new_kernel_thread(entry, arg, kstack_top),
+        }
+        .push_at(kstack_top)
+    }
+    pub unsafe fn new_kernel_thread_for_user(
+        entry_addr: usize,
+        ustack_top: usize,
+        kstack_top: usize,
+        cr3: usize,
+    ) -> Self {
+        InitStack {
+            context: ContextData::new(cr3),
+            tf: TrapFrame::new_kernel_thread_for_user(entry_addr, ustack_top),
         }
         .push_at(kstack_top)
     }

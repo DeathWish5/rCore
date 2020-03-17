@@ -3,6 +3,7 @@
 .intel_syntax noprefix
 
 __alltraps:
+    jmp __kalltraps
     push rax
     push rcx
     push rdx

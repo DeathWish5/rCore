@@ -25,6 +25,7 @@ pub use self::mem::*;
 pub use self::misc::*;
 pub use self::net::*;
 pub use self::proc::*;
+pub use self::rethink::*;
 pub use self::time::*;
 
 mod custom;
@@ -35,6 +36,7 @@ mod mem;
 mod misc;
 mod net;
 mod proc;
+mod rethink;
 mod time;
 
 #[cfg(feature = "profile")]
@@ -56,7 +58,7 @@ pub fn syscall(id: usize, args: [usize; 6], tf: &mut TrapFrame) -> isize {
 
 /// All context needed for syscall
 struct Syscall<'a> {
-    thread: &'a mut Thread,
+    pub thread: &'a mut Thread,
     tf: &'a mut TrapFrame,
 }
 
@@ -257,11 +259,18 @@ impl Syscall<'_> {
                 args[3] as *mut u32,
                 args[4],
             ),
-            SYS_EXECVE => self.sys_exec(
-                args[0] as *const u8,
-                args[1] as *const *const u8,
-                args[2] as *const *const u8,
-            ),
+            SYS_EXECVE => match (self.tf.cs & 3) {
+                0 => self.sys_kernel_exec(
+                    args[0] as *const u8,
+                    args[1] as *const *const u8,
+                    args[2] as *const *const u8,
+                ),
+                _ => self.sys_exec(
+                    args[0] as *const u8,
+                    args[1] as *const *const u8,
+                    args[2] as *const *const u8,
+                ),
+            },
             SYS_EXIT => self.sys_exit(args[0] as usize),
             SYS_EXIT_GROUP => self.sys_exit_group(args[0]),
             SYS_WAIT4 => self.sys_wait4(args[0] as isize, args[1] as *mut i32), // TODO: wait4
@@ -346,6 +355,9 @@ impl Syscall<'_> {
             SYS_GET_PADDR => {
                 self.sys_get_paddr(args[0] as *const u64, args[1] as *mut u64, args[2])
             }
+
+            // add for rethink
+            SYS_GET_SYSCALL => self.sys_get_syscall(),
 
             _ => {
                 let ret = match () {
@@ -463,8 +475,14 @@ impl Syscall<'_> {
             ),
             SYS_DUP2 => self.sys_dup2(args[0], args[1]),
             SYS_ALARM => self.unimplemented("alarm", Ok(0)),
-            SYS_FORK => self.sys_fork(),
-            SYS_VFORK => self.sys_vfork(),
+            SYS_FORK => match (self.tf.cs & 0x3) {
+                0 => self.sys_kernel_fork(),
+                _ => self.sys_fork(),
+            },
+            SYS_VFORK => match (self.tf.cs & 0x3) {
+                0 => self.sys_vkernel_fork(),
+                _ => self.sys_vfork(),
+            },
             SYS_RENAME => self.sys_rename(args[0] as *const u8, args[1] as *const u8),
             SYS_MKDIR => self.sys_mkdir(args[0] as *const u8, args[1]),
             SYS_RMDIR => self.sys_rmdir(args[0] as *const u8),

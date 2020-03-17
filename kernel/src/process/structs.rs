@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, sync::Weak, vec::Vec};
-use core::fmt;
+use core::{fmt, slice};
 
 use core::str;
 use log::*;
@@ -16,7 +16,8 @@ use crate::arch::interrupt::{Context, TrapFrame};
 use crate::fs::{FileHandle, FileLike, OpenOptions, FOLLOW_MAX_DEPTH};
 use crate::ipc::SemProc;
 use crate::memory::{
-    ByFrame, Delay, File, GlobalFrameAlloc, KernelStack, MemoryAttr, MemorySet, Read,
+    kernel_stack_range, ByFrame, Delay, File, GlobalFrameAlloc, KernelStack, MemoryAttr, MemorySet,
+    Read,
 };
 use crate::sync::{Condvar, SpinNoIrqLock as Mutex};
 
@@ -26,8 +27,8 @@ use core::mem::MaybeUninit;
 use rcore_fs::vfs::INode;
 
 pub struct Thread {
-    context: Context,
-    kstack: KernelStack,
+    pub context: Context,
+    pub kstack: KernelStack,
     /// Kernel performs futex wake when thread exits.
     /// Ref: [http://man7.org/linux/man-pages/man2/set_tid_address.2.html]
     pub clear_child_tid: usize,
@@ -116,7 +117,9 @@ impl Thread {
         let vm = Arc::new(Mutex::new(vm));
         let kstack = KernelStack::new();
         Box::new(Thread {
-            context: unsafe { Context::new_kernel_thread(entry, arg, kstack.top(), vm_token) },
+            context: unsafe {
+                Context::new_kernel_thread(entry as usize, arg, kstack.top(), vm_token)
+            },
             kstack,
             clear_child_tid: 0,
             vm: vm.clone(),
@@ -126,6 +129,178 @@ impl Thread {
                 files: BTreeMap::default(),
                 cwd: String::from("/"),
                 exec_path: String::new(),
+                semaphores: SemProc::default(),
+                futexes: BTreeMap::default(),
+                pid: Pid(0),
+                parent: Weak::new(),
+                children: Vec::new(),
+                threads: Vec::new(),
+                child_exit: Arc::new(Condvar::new()),
+                child_exit_code: BTreeMap::new(),
+            }
+            .add_to_table(),
+        })
+    }
+
+    pub fn new_kernel_vm(
+        inode: &Arc<dyn INode>,
+        exec_path: &str,
+        mut args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<(MemorySet, usize, usize), &'static str> {
+        let mut data: [u8; 0x3c0] = unsafe { MaybeUninit::zeroed().assume_init() };
+        inode
+            .read_at(0, &mut data)
+            .map_err(|_| "failed to read from INode")?;
+
+        // Parse ELF
+        let elf = ElfFile::new(&data)?;
+
+        // Check ELF type
+        match elf.header.pt2.type_().as_type() {
+            header::Type::Executable => {}
+            header::Type::SharedObject => {}
+            _ => return Err("ELF is not executable or shared object"),
+        }
+
+        // Check ELF arch
+        match elf.header.pt2.machine().as_machine() {
+            #[cfg(target_arch = "x86_64")]
+            header::Machine::X86_64 => {}
+            #[cfg(target_arch = "aarch64")]
+            header::Machine::AArch64 => {}
+            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+            header::Machine::Other(243) => {}
+            #[cfg(target_arch = "mips")]
+            header::Machine::Mips => {}
+            _ => return Err("invalid ELF arch"),
+        }
+
+        let mut auxv = {
+            let mut map = BTreeMap::new();
+            if let Some(phdr_vaddr) = elf.get_phdr_vaddr() {
+                map.insert(abi::AT_PHDR, phdr_vaddr as usize);
+            }
+            map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
+            map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
+            map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+            map
+        };
+        let mut entry_addr = elf.header.pt2.entry_point() as usize;
+        let (mut vm, bias) = elf.make_kernel_memory_set(inode);
+        if let Ok(loader_path_) = elf.get_interpreter() {
+            info!("Handling interpreter... offset={:x}", bias);
+            let loader_path = "/rethink/ld-musl-x86_64.so.1";
+            info!("loader_path = {}", loader_path);
+            // assuming absolute path
+            let interp_inode = crate::fs::ROOT_INODE
+                .lookup_follow(loader_path, FOLLOW_MAX_DEPTH)
+                .map_err(|_| "interpreter not found")?;
+            // load loader by bias and set aux vector.
+            let mut interp_data: [u8; 0x3c0] = unsafe { MaybeUninit::zeroed().assume_init() };
+            interp_inode
+                .read_at(0, &mut interp_data)
+                .map_err(|_| "failed to read from INode")?;
+            let elf_interp = ElfFile::new(&interp_data)?;
+            elf_interp.append_as_kernel_interpreter(&interp_inode, &mut vm, bias);
+            info!("entry point: {:x}", elf.header.pt2.entry_point() as usize);
+            info!(
+                "interp entry point: {:x}",
+                elf_interp.header.pt2.entry_point() as usize
+            );
+            auxv.insert(abi::AT_ENTRY, elf.header.pt2.entry_point() as usize);
+            auxv.insert(abi::AT_BASE, bias);
+            entry_addr = elf_interp.header.pt2.entry_point() as usize + bias;
+        }
+
+        // User stack
+        use crate::consts::{USER_STACK_OFFSET, USER_STACK_SIZE};
+        let mut ustack_top = {
+            let ustack_buttom = USER_STACK_OFFSET;
+            let ustack_top = USER_STACK_OFFSET + USER_STACK_SIZE;
+            vm.push(
+                ustack_buttom,
+                ustack_top,
+                MemoryAttr::default().user(),
+                ByFrame::new(GlobalFrameAlloc),
+                "user_stack",
+            );
+            ustack_top
+        };
+
+        let init_info = ProcInitInfo { args, envs, auxv };
+        unsafe {
+            vm.with(|| ustack_top = init_info.push_at(ustack_top));
+        }
+        Ok((vm, entry_addr, ustack_top))
+    }
+
+    pub fn new_kernel_from_inode(
+        inode: &Arc<dyn INode>,
+        exec_path: &str,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Box<Thread> {
+        let kstack = KernelStack::new();
+        let kstack_top = kstack.top();
+        let (vm, entry_addr, ustack_top) =
+            Self::new_kernel_vm(inode, exec_path, args, envs).unwrap();
+        let vm_token = vm.token();
+        let vm = Arc::new(Mutex::new(vm));
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            0,
+            FileLike::File(FileHandle::new(
+                crate::fs::STDIN.clone(),
+                OpenOptions {
+                    read: true,
+                    write: false,
+                    append: false,
+                    nonblock: false,
+                },
+                String::from("stdin"),
+            )),
+        );
+        files.insert(
+            1,
+            FileLike::File(FileHandle::new(
+                crate::fs::STDOUT.clone(),
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    append: false,
+                    nonblock: false,
+                },
+                String::from("stdout"),
+            )),
+        );
+        files.insert(
+            2,
+            FileLike::File(FileHandle::new(
+                crate::fs::STDOUT.clone(),
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    append: false,
+                    nonblock: false,
+                },
+                String::from("stderr"),
+            )),
+        );
+
+        Box::new(Thread {
+            context: unsafe {
+                Context::new_kernel_thread_for_user(entry_addr, ustack_top, kstack_top, vm_token)
+            },
+            kstack,
+            clear_child_tid: 0,
+            vm: vm.clone(),
+            proc: Process {
+                vm,
+                files,
+                cwd: String::from("/"),
+                exec_path: String::from(exec_path),
                 semaphores: SemProc::default(),
                 futexes: BTreeMap::default(),
                 pid: Pid(0),
@@ -193,8 +368,10 @@ impl Thread {
 
         // Check interpreter (for dynamic link)
         // When interpreter is used, map both dynamic linker and executable
-        if let Ok(loader_path) = elf.get_interpreter() {
+        if let Ok(loader_path_) = elf.get_interpreter() {
             info!("Handling interpreter... offset={:x}", bias);
+            let loader_path = "./rethink/ld-n-musl-x86_64.so.1";
+            info!("loader_path = {}", loader_path);
             // assuming absolute path
             let interp_inode = crate::fs::ROOT_INODE
                 .lookup_follow(loader_path, FOLLOW_MAX_DEPTH)
@@ -330,7 +507,58 @@ impl Thread {
         let vm_token = vm.token();
         let vm = Arc::new(Mutex::new(vm));
         let context = unsafe { Context::new_fork(tf, kstack.top(), vm_token) };
+        let mut proc = self.proc.lock();
+        let new_proc = Process {
+            vm: vm.clone(),
+            files: proc.files.clone(),
+            cwd: proc.cwd.clone(),
+            exec_path: proc.exec_path.clone(),
+            semaphores: SemProc::default(),
+            futexes: BTreeMap::default(),
+            pid: Pid(0),
+            parent: Arc::downgrade(&self.proc),
+            children: Vec::new(),
+            threads: Vec::new(),
+            child_exit: Arc::new(Condvar::new()),
+            child_exit_code: BTreeMap::new(),
+        }
+        .add_to_table();
+        // link to parent
+        proc.children.push(Arc::downgrade(&new_proc));
 
+        Box::new(Thread {
+            context,
+            kstack,
+            clear_child_tid: 0,
+            vm,
+            proc: new_proc,
+        })
+    }
+
+    pub fn kernel_fork(&self, tf: &TrapFrame) -> Box<Thread> {
+        let kstack = KernelStack::new();
+        let mut kstack_top = kstack.top();
+        // DELETED, if yout still want to use kernel stack as normal stack, this code will help
+        unsafe {
+            info!("into kernel fork unsafe");
+            // Copy the whole kernel stack: [rsp, kstack_top)
+            let src_bottom = tf.rsp;
+            let length = kernel_stack_range().1 - src_bottom;
+            let src_slice = slice::from_raw_parts(src_bottom as *const u8, length);
+            let dst_bottom = kstack_top - length;
+            let mut dst_slice = slice::from_raw_parts_mut(dst_bottom as *mut u8, length);
+            dst_slice.copy_from_slice(src_slice);
+            info!(
+                "copy kernel stack from {:x} to {:x}, length = {:x}",
+                src_bottom, dst_bottom, length
+            );
+            kstack_top = dst_bottom;
+            info!("out kernel unsafe");
+        }
+        let vm = self.vm.lock().clone();
+        let vm_token = vm.token();
+        let vm = Arc::new(Mutex::new(vm));
+        let context = unsafe { Context::new_fork(tf, kstack_top, vm_token) };
         let mut proc = self.proc.lock();
         let new_proc = Process {
             vm: vm.clone(),
@@ -432,12 +660,19 @@ impl Process {
 }
 
 trait ToMemoryAttr {
-    fn to_attr(&self) -> MemoryAttr;
+    fn to_attr_(&self, in_kernel: bool) -> MemoryAttr;
+
+    fn to_attr(&self) -> MemoryAttr {
+        self.to_attr_(false)
+    }
 }
 
 impl ToMemoryAttr for Flags {
-    fn to_attr(&self) -> MemoryAttr {
-        let mut flags = MemoryAttr::default().user();
+    fn to_attr_(&self, in_kernel: bool) -> MemoryAttr {
+        let mut flags: MemoryAttr = match in_kernel {
+            true => MemoryAttr::default().kernel(),
+            _ => MemoryAttr::default().user(),
+        };
         if self.is_execute() {
             flags = flags.execute();
         }
@@ -453,12 +688,21 @@ trait ElfExt {
     /// Generate a MemorySet according to the ELF file.
     fn make_memory_set(&self, inode: &Arc<dyn INode>) -> (MemorySet, usize);
 
+    fn make_kernel_memory_set(&self, inode: &Arc<dyn INode>) -> (MemorySet, usize);
+
     /// Get interpreter string if it has.
     fn get_interpreter(&self) -> Result<&str, &str>;
 
     /// Append current ELF file as interpreter into given memory set.
     /// This will insert the interpreter it a place which is "good enough" (since ld.so should be PIC).
     fn append_as_interpreter(
+        &self,
+        inode: &Arc<dyn INode>,
+        memory_set: &mut MemorySet,
+        bias: usize,
+    );
+
+    fn append_as_kernel_interpreter(
         &self,
         inode: &Arc<dyn INode>,
         memory_set: &mut MemorySet,
@@ -500,6 +744,37 @@ impl ElfExt for ElfFile<'_> {
             (Page::of_addr(farthest_memory + PAGE_SIZE)).start_address(),
         )
     }
+
+    fn make_kernel_memory_set(&self, inode: &Arc<dyn INode>) -> (MemorySet, usize) {
+        debug!("creating MemorySet from ELF");
+        let mut ms = MemorySet::new();
+        let mut farthest_memory: usize = 0;
+        for ph in self.program_iter() {
+            if ph.get_type() != Ok(Type::Load) {
+                continue;
+            }
+            ms.push(
+                ph.virtual_addr() as usize,
+                ph.virtual_addr() as usize + ph.mem_size() as usize,
+                ph.flags().to_attr_(true),
+                File {
+                    file: INodeForMap(inode.clone()),
+                    mem_start: ph.virtual_addr() as usize,
+                    file_start: ph.offset() as usize,
+                    file_end: ph.offset() as usize + ph.file_size() as usize,
+                    allocator: GlobalFrameAlloc,
+                },
+                "elf",
+            );
+            if ph.virtual_addr() as usize + ph.mem_size() as usize > farthest_memory {
+                farthest_memory = ph.virtual_addr() as usize + ph.mem_size() as usize;
+            }
+        }
+        (
+            ms,
+            (Page::of_addr(farthest_memory + PAGE_SIZE)).start_address(),
+        )
+    }
     fn append_as_interpreter(&self, inode: &Arc<dyn INode>, ms: &mut MemorySet, bias: usize) {
         debug!("inserting interpreter from ELF");
 
@@ -511,6 +786,33 @@ impl ElfExt for ElfFile<'_> {
                 ph.virtual_addr() as usize + bias,
                 ph.virtual_addr() as usize + ph.mem_size() as usize + bias,
                 ph.flags().to_attr(),
+                File {
+                    file: INodeForMap(inode.clone()),
+                    mem_start: ph.virtual_addr() as usize + bias,
+                    file_start: ph.offset() as usize,
+                    file_end: ph.offset() as usize + ph.file_size() as usize,
+                    allocator: GlobalFrameAlloc,
+                },
+                "elf-interp",
+            )
+        }
+    }
+    fn append_as_kernel_interpreter(
+        &self,
+        inode: &Arc<dyn INode>,
+        ms: &mut MemorySet,
+        bias: usize,
+    ) {
+        debug!("inserting interpreter from ELF");
+
+        for ph in self.program_iter() {
+            if ph.get_type() != Ok(Type::Load) {
+                continue;
+            }
+            ms.push(
+                ph.virtual_addr() as usize + bias,
+                ph.virtual_addr() as usize + ph.mem_size() as usize + bias,
+                ph.flags().to_attr_(true),
                 File {
                     file: INodeForMap(inode.clone()),
                     mem_start: ph.virtual_addr() as usize + bias,

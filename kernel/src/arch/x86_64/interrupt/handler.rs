@@ -71,6 +71,7 @@ use bitflags::*;
 use log::*;
 
 global_asm!(include_str!("trap.asm"));
+global_asm!(include_str!("ktrap.asm"));
 global_asm!(include_str!("vector.asm"));
 
 #[allow(non_upper_case_globals)]
@@ -113,6 +114,12 @@ pub extern "C" fn rust_trap(tf: &mut TrapFrame) {
             super::super::gdt::Cpu::current().handle_ipi();
         }
         _ => panic!("Unhandled interrupt {:x}", tf.trap_num),
+    }
+    if (tf.trap_num != 0x20 && tf.trap_num != 0x24) {
+        info!(
+            "out rust_trap return_addr = {:#x} cs = {:#x}",
+            tf.rip, tf.cs
+        )
     }
 }
 

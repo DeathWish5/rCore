@@ -46,7 +46,7 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     );
 
     // setup fast syscall in x86_64
-    interrupt::fast_syscall::init();
+    // interrupt::fast_syscall::init();
 
     // Init physical memory management
     memory::init(boot_info);

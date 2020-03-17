@@ -204,3 +204,17 @@ pub fn copy_from_user<T>(addr: *const T) -> Option<T> {
         _ => None,
     }
 }
+
+#[cfg(any(target_arch = "x86_64"))]
+/// Get kstack of the current thread, but we can't call rcore::process::current_thread()
+/// Noticing that KernelStack is aligned with KSTACK_SIZE, we read %rsp directly to get kstack
+pub unsafe fn kernel_stack_range() -> (usize, usize) {
+    let mut kstack_bottom: usize = 0;
+    asm!("mov %rsp, $0": "=r"(kstack_bottom));
+    kstack_bottom &= !(KSTACK_SIZE - 1);
+    (kstack_bottom, kstack_bottom + KSTACK_SIZE)
+}
+#[cfg(not(any(target_arch = "x86_64")))]
+pub unsafe fn kernel_stack_range() -> (usize, usize) {
+    (0, 0)
+}

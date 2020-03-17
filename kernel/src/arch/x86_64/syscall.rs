@@ -337,6 +337,9 @@ pub const SYS_STATX: usize = 332;
 pub const SYS_IO_PGETEVENTS: usize = 333;
 pub const SYS_RSEQ: usize = 334;
 
+//add for rethink
+pub const SYS_GET_SYSCALL: usize = 335;
+
 // custom temporary syscall
 pub const SYS_MAP_PCI_DEVICE: usize = 999;
 pub const SYS_GET_PADDR: usize = 998;
